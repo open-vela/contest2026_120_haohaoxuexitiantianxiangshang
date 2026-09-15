@@ -120,6 +120,7 @@ MiMo TTS playback OK.
 | `packages/ai_agent/src/voice/voice_wake.c` | 唤醒窗口传 `require_speech=true`；`-EAGAIN` 立即重新开窗 |
 | `packages/ai_agent/src/ui/lvgl_ui_channel.c` | 对话路径传 `false`，行为不变 |
 | `packages/ai_agent/src/channels/cmd_voice.c` | `voice_wake_test` 拼接全部参数 |
+| `contest2026_.../app/hello_app/voice_ui_bridge.c` | **改签名时漏改的调用点**（见下） |
 | `tests/voice_integration.c` | 新增 3 条门控用例；唤醒用例补上「有人声」的假麦克风 |
 
 ### 验证状态
@@ -129,6 +130,43 @@ MiMo TTS playback OK.
   （本轮新增 3 组门控用例）。
 - **真机**：本轮改动**已构建打包，尚未烧录**。英文唤醒、门控生效、TTS 出声
   三项的复验数据待烧录后补。**在拿到复验数据前，不把英文唤醒写成「已通过」。**
+
+**构建与配对取证**（`verify_pair.py` 全绿，`exit=0`）：
+
+| 项 | 值 |
+|---|---|
+| 候选改动文件 | 11 |
+| 已重编改动单元 | 7 |
+| 本板不编译、显式豁免 | 1（`lvgl_ui_channel.c`） |
+| 源码哈希核验 | 202 项全部通过 |
+| ELF ↔ BIN | `objcopy -R .note.gnu.build-id` 后逐字节相同 |
+| `nuttx.bin` | 11,859,380 B · `b913d2549b5dff48541426326aa9f3ac4f698078be47d2a02320392d01d97b96` |
+| `vela_nsh.elf` | 68,685,724 B · `4e9e12b218041a981de075c64b9e92ed57463165b7e5d2f4693103f7fdb06f91` |
+| 可烧录镜像 | 40,845,312 B · `b0f7386f80e7f05fe59e9659ba1e7024239e6a203a1ecaf8ee04b6cfc7d5b5f5` |
+
+**`lvgl_ui_channel.c` 的豁免是被断言的**：它属于 `CONFIG_AI_AGENT_LVGL_UI` 路径，
+本板未启用（`Makefile` 里那一行还指向不存在的 `src/lvgl_ui/`）。`verify_pair.py`
+要求该文件必须**确实不出现**在编译日志里，所以这条豁免不可能掩盖「某文件因别的原因
+没编上」；其内容仍由哈希核验。
+
+### 一个会真的出问题的漏改（PTT 路径）
+
+`app/hello_app/voice_ui_bridge.c` **不包含 ai_agent 的头文件**（两边是独立仓库），
+自己写了一份 `extern` 原型。给 `voice_channel_stop_with_text()` 加第三个参数时，
+该文件被漏改，仍按**两个参数**声明和调用。它**是参与构建的**
+（`Makefile` 的 `CSRCS += voice_ui_bridge.c`），所以第三个参数会取寄存器里的
+**残留值**——端点门控在 PTT 路径上会随机开或关。唯一可见症状是链接期那条
+`-Wlto-type-mismatch`，而它把位置指到了完全无关的 `ccu_nkmp.c`，极易被当成 LTO
+噪声划过去（同一日志里 `z_sched_wake` 等确实各有同类噪声）。
+**修法**：补上第三个参数，PTT 传 `false`（用户主动按键，不门控）。
+**反证**：修好后该警告消失，证明它是真问题。
+
+### 两处同名遗留（不修，如实记录）
+
+- `packages/demos/mini_memo/mini_memo_core.c:796/955` 有同样的两参数声明与调用。
+  但 `CONFIG_LVX_USE_DEMO_MINI_MEMO is not set`、构建日志里 0 次出现，**不参与构建**；
+  且它不在本轮审计基线范围内，属上游 demo 代码。将来若启用该 demo，需同步补第三个参数。
+- `packages/ai_agent/src/ui/lvgl_ui_channel.c` 同样不参与本板构建，已显式豁免（见上）。
 
 ### 串口事实更正
 

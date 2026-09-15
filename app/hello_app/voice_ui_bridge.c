@@ -49,7 +49,11 @@
 
 extern int voice_channel_init(void);
 extern int voice_channel_start(void);
-extern int voice_channel_stop_with_text(char *text_out, size_t text_cap);
+/* PTT is an explicit user action, so the endpoint gate stays off here:
+ * the third argument mirrors the dialogue path in lvgl_ui_channel.c.
+ */
+extern int voice_channel_stop_with_text(char *text_out, size_t text_cap,
+                                        bool require_speech);
 extern int voice_channel_speak(const char *text);
 extern int voice_channel_play_notification_prompt(void);
 
@@ -238,7 +242,7 @@ static void *ptt_worker(void *arg)
 
       pthread_mutex_unlock(&g_ptt_lock);
       memset(text, 0, sizeof(text));
-      ret = voice_channel_stop_with_text(text, sizeof(text));
+      ret = voice_channel_stop_with_text(text, sizeof(text), false);
       pthread_mutex_lock(&g_ptt_lock);
 
       g_ptt.result = ret;
