@@ -1,6 +1,6 @@
 # R528 学习终端：当前硬件与链路状态
 
-> 更新时间：2026-09-13  
+> 更新时间：2026-09-15  
 > 规则：**“源码存在 / 已构建打包 / 已烧录 / 真机通过”是四个不同结论。** 本文只把确有现场证据的项目写为“真机通过”。不会记录 API Key、WiFi 密码或 Authorization 值。
 
 ## 总览
@@ -17,10 +17,10 @@
 | 本地扬声器 | **真机通过** | `nxplayer` 已播放 1 kHz 测试音。 |
 | 开机语音介绍 | **bootvoice2 已烧录有声，清晰度未通过** | 用户确认开机有声；9/5 候选另存衰减 6 dB PCM，原始音频保留，听感待验。 |
 | 串口控制台 | **真机恢复正常** | 保留 `nxplayer < /data/audio/bootvoice.cmd &`；用户最新报告串口不卡死。 |
-| MiMo TTS | **连续对话播报尚待真机验收** | 上一轮有唤醒录音占用问题；本候选在等待与播报期间保留请求所有权。主机三轮与故障注入通过，不等于板端已出声。 |
+| MiMo TTS | **真机已出声（走 nxplayer 回退）** | 2026-09-15 真机 `voice_test_speak 语音播报测试` → `MiMo TTS playback OK.`，`nxplayer fallback finished: status=0 bytes=84480`，total 5353ms；唤醒监听同时运行再测一次仍 OK（4526ms）。`media_player_open()` 在本板返回 NULL，播放走 `audio_playback.c` 的 nxplayer 回退（PCM 落盘 + `playraw`），**该告警不是故障**。 |
 | 数字麦克风 | **硬件/PCM 采集通过** | `hw:snddmic` 可打开，16 kHz / 16-bit / 单声道数据峰值非零。 |
 | MiMo ASR | **连续批量识别有现场成功证据** | 用户报告识别较准；日志有多轮 80000 bytes/25 chunks 与成功文本，也有空结果错误。`0 sent` 指未流式发送，不代表 batch ASR 没提交。 |
-| 唤醒词 | **短语匹配已真机全部通过；端到端待有效 Key** | 本候选统一为「你好，openvela」（含 `Hello，openvela`），匹配折叠 ASCII 大小写与分隔符，品牌唤醒词已移除。**2026-09-13 真机实测六条用例全部符合预期**：3 条正向命中、`你好小米` / `小米同学` / `你好` 全部 `Wake match: no`（不依赖麦克风、网络或 Key）。**仍是在线批量 ASR，不是离线唤醒**——Key 过期则喊不醒。 |
+| 唤醒词 | **匹配逻辑真机通过；英文链路有两个缺陷已修，待烧录复验** | 2026-09-13 六条用例通过、2026-09-15 复测 `Hello，openvela` / `Hello，OpenVela` / `你好，openvela` 仍 yes，`你好小米` 仍 no——**匹配函数是对的**。但真机发现两个下游缺陷：`voice_wake_test` 只取 `argv[1]`（`Hello, openvela` 被截成 `Hello,` → 误报 no），以及 `mimo_asr.c` 把 ASR 语种写死 `zh`（英文被按中文解码）。两者均已在 2026-09-15 候选修复，**真机复验待烧录**。**仍是云端批量 ASR 轮询，不是离线唤醒**——Key 过期则喊不醒。 |
 | 对话速度 | **低延迟候选已打包，板端耗时未测** | `mimo-v2.5` 关闭思考、限制输出，去掉云端唤醒应答；等待慢回复期间不重新录音。 |
 | 提醒与主页圆环 | **提醒本体用户确认可用；提醒中心与圆环联动待真机验收** | 9/12 候选新增提醒中心（四种内容、10 秒–1 小时、三项快捷、16 条上限、逐条取消、清除全部、5 分钟后再提醒）。主页仍用调度器同一份快照，不建第二套倒计时。83 组主机检查通过。 |
 | 离线提示音 | **主机通过，真机待验** | 本地 360 ms 双音（600/800 Hz），不访问 MiMo；到期通知尊重主音量 0，语音页活动期间延后。返回 0 只表示受理，不代表已出声。 |
@@ -29,7 +29,116 @@
 | 学习报告 | **主机通过，真机待验** | 工具页第三个标签：今日专注 / 完成轮次 / 连续天数 / 近 7 天累计对周目标 / 任务待办。全部由 `focus_stats` 现算，不新增持久化。 |
 | `set_llm` | **现场待核对** | 当前源码与诊断 ELF 都有命令，但曾在板端得到 `Unknown command`。 |
 
-## 2026-09-12 唤醒词合规统一（当前候选）
+## 2026-09-15 唤醒词英文识别与唤醒监听流量修复（当前候选）
+
+本轮首次接通板端串口（`COM15` / 1500000 8N1 / CH343），把用户三条反馈
+（「英文唤醒词检测不到」「开唤醒词就一直识别语音转文字」「经常不能说话」）
+查成**三个互相独立的缺陷**，全部有逐字串口日志支撑。
+完整记录见 [wake-gate-20260915.md](wake-gate-20260915.md)。
+
+### 真机实测：匹配逻辑是对的，坏的是命令
+
+`voice_wake_test` 不依赖麦克风、网络或 Key，2026-09-15 在 `vela>` 下逐条实测：
+
+| 用例 | 期望 | 实测 |
+|---|---|---|
+| `voice_wake_test Hello，openvela` | yes | **yes** |
+| `voice_wake_test Hello, openvela` | yes | **no** ← 缺陷 A |
+| `voice_wake_test hello openvela` | yes | **no** ← 缺陷 A |
+| `voice_wake_test 你好，openvela` | yes | **yes** |
+| `voice_wake_test Hello，OpenVela` | yes | **yes** |
+| `voice_wake_test 你好小米` | no | **no** |
+
+**缺陷 A（命令层）**：`cmd_voice_wake_test()` 只取 `argv[1]`。NSH 按空格分词，
+`Hello, openvela` 被截成 `Hello,`，规范化后只剩 `hello` → 误报 `no`。
+用英文键盘输入这句几乎必然踩到，而报告正是引用这条命令当证据。
+**已修**：拼接 `argv[1..]` 后再匹配。
+
+**缺陷 B（识别层）**：`mimo_asr.c` 把 `asr_options.language` 写死为 `"zh"`。
+官方文档明确「使用 `asr_options.language` 指定语种，**未配置时为自动检测**，
+支持取值 `auto`/`zh`/`en`」，且该模型「支持中英双语识别及**自动语种检测**……
+自动识别语码混用中的各语言内容」。写死 `zh` 使英文唤醒词被强行按中文解码，
+转写文本里不会出现 `helloopenvela` —— 这解释了「中文喊得醒、英文喊不醒」的全部现象。
+**已修**：改为 `"auto"`。
+
+### 真机实测：唤醒监听在空转
+
+`voice_wake_start` 后静置 65 秒的串口日志统计：
+
+| 指标 | 实测 |
+|---|---|
+| 云端 ASR 上传 | **20 次**（上传时间戳平均间隔约 **4.3 秒**） |
+| 每次上传体积 | **80,000 字节** PCM |
+| TLS 握手 | **21 次**（每轮一次完整握手，无连接复用） |
+| 静音时的识别结果 | `诶。` / `1.` / `1.` / `<chinese> Yeah.` / `邪恶猫猫，你觉得男生是？` … |
+
+**缺陷 C（功耗与延迟）**：房间是安静的，设备却每 4.3 秒上传 80 KB 音频并做一次
+完整 TLS 握手，7×24 不停（约 840 次/小时、约 2 万次/天），换回来全是幻觉文本。
+它持续抢占 WiFi / TLS / CPU，拖慢前台问答与 TTS 播报
+——**这就是「经常不能说话」的直接原因**。
+
+**已修**：复用代码里**已有的**本地端点启发式 `track_utterance()`
+（判据：均值 ≥ 250 **且** 峰值 ≥ 1200，持续 ≥ 200 ms 才算人声；
+原本只用于对话自动断句）。`voice_channel_stop_with_text()` 新增 `require_speech`：
+
+- 唤醒窗口传 `true`：没人说话就**本地丢弃、零网络请求**，返回 `-EAGAIN`；
+- 用户主动发起的对话传 `false`：行为与改动前完全一致。
+
+日志改为边沿触发——长时间安静只留一行，检测到人声时才打印一行。
+
+**边界**：这仍是**云端批量 ASR 轮询，不是离线唤醒，也不是流式唤醒**。
+门控消掉了空转上传，但没有改变它的本质。真正的解法是本地关键词唤醒（KWS），
+R528S3 上需要移植或训练小模型，**按剩余时间（截止 9-20）不现实，不作承诺**。
+
+### 顺带确认：TTS 真机是能出声的
+
+```
+[voice] TTS network done: 3318ms
+[audio_pb] nxplayer fallback playback: 1760ms
+nxplayer> playraw /data/ai_agent/tts_stream.pcm 1 16 24000 0
+[audio_pb] nxplayer fallback finished: status=0 bytes=84480
+[voice] speak done: total 5353ms (play wait 2035ms)
+MiMo TTS playback OK.
+```
+
+`media_player_open()` 在本板返回 NULL（媒体服务 RPC 路径不可用），播放走
+`audio_playback.c` 的 **nxplayer 回退**：PCM 落到 `/data/ai_agent/tts_stream.pcm`，
+再由 NxPlayer `playraw` 播放，84480 字节播放成功。**该告警不是故障**，
+此前把 `media_player_open failed` 读成「不能出声」是误判。
+
+用户日志里的 `TTS stream failed: -71`（`EPROTO`）出在 TTS **网络流**上，不是播放。
+本轮在唤醒监听同时运行的条件下重测 `voice_test_speak`，仍
+`MiMo TTS playback OK.`（total 4526ms），属瞬时网络错误。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `packages/ai_agent/src/voice/mimo_asr.c` | `asr_options.language`：`zh` → `auto` |
+| `packages/ai_agent/src/voice/voice_channel.h` | `voice_channel_stop_with_text()` 增加 `bool require_speech` |
+| `packages/ai_agent/src/voice/voice_channel.c` | 新增本地端点门控，复用 `track_utterance()` |
+| `packages/ai_agent/src/voice/voice_wake.c` | 唤醒窗口传 `require_speech=true`；`-EAGAIN` 立即重新开窗 |
+| `packages/ai_agent/src/ui/lvgl_ui_channel.c` | 对话路径传 `false`，行为不变 |
+| `packages/ai_agent/src/channels/cmd_voice.c` | `voice_wake_test` 拼接全部参数 |
+| `tests/voice_integration.c` | 新增 3 条门控用例；唤醒用例补上「有人声」的假麦克风 |
+
+### 验证状态
+
+- **主机**：`tests/run_checks.py` **64 PASS / exit 0**、
+  `tests/run_ui_checks.py` **22 PASS / exit 0**，合计 **86 组全过**
+  （本轮新增 3 组门控用例）。
+- **真机**：本轮改动**已构建打包，尚未烧录**。英文唤醒、门控生效、TTS 出声
+  三项的复验数据待烧录后补。**在拿到复验数据前，不把英文唤醒写成「已通过」。**
+
+### 串口事实更正
+
+此前本文写「串口单行上限 64 字符（`CONFIG_NSH_LINELEN=64`）」，**该说法不适用于
+`vela>`**：`vela>` 的 REPL 缓冲区是 `LINE_LEN 256`（`nsh_commands.c:75`），
+本轮已实测 40+ 字符含中文命令可直接执行；`CONFIG_NSH_LINELEN=64` 只约束 NSH 下的
+`study-terminal.sh`。
+
+## 2026-09-12 唤醒词合规统一（已被 2026-09-15 候选取代）
+
 
 官方《大赛总览》要求含语音唤醒的项目统一使用「你好，openvela / Hello，openvela」，
 本项目此前是「你好小米」，属**合规硬伤**而非体验问题。本轮把 7 处全部改掉，其中
@@ -103,10 +212,12 @@
 **Key 不用重烧就能换**：`router_set mimo <key>` 或 `router_set <preset> <key>`
 （支持 deepseek / kimi / qwen / openai 等），之后 `router_status` 确认。
 
-**注意**：`voice_wake_test` 属 `vela>` 提示符下的命令（`nsh>` 下先执行 `ai_agent`），
-且串口单行上限 64 字符（`CONFIG_NSH_LINELEN=64`）。测试时请在干净的 `vela>` 提示符下
-逐条执行——在 `recording...` 期间输入会与提示符输出交错（首次日志即如此，
-虽然结果仍有效，但后续复测建议避开）。
+**注意**：`voice_wake_test` 属 `vela>` 提示符下的命令（`nsh>` 下先执行 `ai_agent`）。
+**2026-09-15 更正**：此前写的「串口单行上限 64 字符（`CONFIG_NSH_LINELEN=64`）」不适用于
+`vela>`——`vela>` 的 REPL 缓冲区是 `LINE_LEN 256`（`nsh_commands.c:75`），本轮已实测
+40+ 字符含中文命令可正常执行；`CONFIG_NSH_LINELEN=64` 只约束 NSH 下的 `study-terminal.sh`。
+测试时请在干净的 `vela>` 提示符下逐条执行——在 `recording...` 期间输入会与提示符输出交错
+（首次日志即如此，虽然结果仍有效，但后续复测建议避开）。
 
 ### 遗留风险
 

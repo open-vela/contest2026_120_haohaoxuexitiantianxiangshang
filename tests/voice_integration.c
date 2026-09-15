@@ -248,7 +248,7 @@ static void *do_start(void *arg) {
 }
 static void *do_stop(void *arg) {
     (void)arg; group = 21; char text[512];
-    atomic_store(&worker_result, voice_channel_stop_with_text(text, sizeof(text)));
+    atomic_store(&worker_result, voice_channel_stop_with_text(text, sizeof(text), false));
     atomic_fetch_sub(&workers, 1); return NULL;
 }
 static void *do_speak(void *arg) {
@@ -355,6 +355,9 @@ int main(void) {
     stop_wake();
     puts("PASS three real bridge PTT/ASR/TTS rounds with wake enabled; request calls <50ms");
 
+    /* The endpoint gate only reaches the cloud when the window holds speech,
+     * so give the fake microphone a voiced window here. */
+    atomic_store(&pcm_pattern, 1);
     start_wake(); atomic_store(&asr_gate, 1); wait_count(&asr_entered, 1);
     atomic_store(&wake_phrase, 1); before=atomic_load(&synths);
     pthread_t worker=launch_worker(do_start); usleep(30000);
@@ -362,6 +365,7 @@ int main(void) {
     atomic_store(&asr_gate, 0); pthread_join(worker, NULL);
     assert(atomic_load(&worker_result) == 0 && atomic_load(&synths) == before);
     assert(voice_channel_cancel() == 0); stop_wake();
+    atomic_store(&pcm_pattern, 0);
     puts("PASS foreground waits for in-flight ASR; late wake match discarded");
 
     assert(voice_channel_start() == 0); usleep(10000);
@@ -388,12 +392,12 @@ int main(void) {
         assert(voice_channel_start() == 0 && voice_channel_cancel() == 0);
     }
     atomic_store(&fail_read, 1); assert(voice_channel_start() == 0); usleep(30000);
-    char text[512]; assert(voice_channel_stop_with_text(text,sizeof(text)) == -EIO);
+    char text[512]; assert(voice_channel_stop_with_text(text,sizeof(text), false) == -EIO);
     assert(voice_channel_start() == 0 && voice_channel_cancel() == 0);
     puts("PASS capture open/start/allocation/thread/read failures all permit retry");
 
     assert(voice_channel_start() == 0); group=99;
-    assert(voice_channel_stop_with_text(text,sizeof(text)) == -EPERM);
+    assert(voice_channel_stop_with_text(text,sizeof(text), false) == -EPERM);
     assert(voice_channel_cancel() == -EPERM && atomic_load(&capture_live) == 1);
     group=21; assert(voice_channel_cancel() == 0);
     atomic_store(&fail_tts,1); assert(voice_channel_speak("故障回答") == -EIO);
@@ -427,9 +431,38 @@ int main(void) {
     assert(voice_channel_start() == 0);
     for (int i = 0; i < 1000 && !voice_channel_utterance_done(); i++) usleep(1000);
     assert(voice_channel_utterance_done());
-    assert(voice_channel_stop_with_text(command, sizeof(command)) == 0);
+    assert(voice_channel_stop_with_text(command, sizeof(command), false) == 0);
     assert(atomic_load(&last_asr_bytes) == AGENT_VOICE_PCM_BUF_SIZE);
     puts("PASS startup spike is not an utterance; full ten-second PCM is retained before stopping");
+
+    /* Endpoint gate: the wake listener re-arms on a timer, so a window with no
+     * speech must not cost a TLS handshake plus an ASR request.  The local
+     * heuristic in track_utterance() saw nothing here. */
+    atomic_store(&pcm_pattern, 0);
+    atomic_store(&last_asr_bytes, 0);
+    assert(voice_channel_start() == 0);
+    for (int i = 0; i < 1000 && !voice_channel_utterance_done(); i++) usleep(1000);
+    assert(voice_channel_stop_with_text(command, sizeof(command), true) == -EAGAIN);
+    assert(atomic_load(&last_asr_bytes) == 0);
+    puts("PASS silent wake window is gated locally with no ASR request");
+
+    /* The same silent window still reaches the cloud for a user-triggered
+     * dialogue, which passes require_speech=false. */
+    atomic_store(&last_asr_bytes, 0);
+    assert(voice_channel_start() == 0);
+    for (int i = 0; i < 1000 && !voice_channel_utterance_done(); i++) usleep(1000);
+    assert(voice_channel_stop_with_text(command, sizeof(command), false) == 0);
+    assert(atomic_load(&last_asr_bytes) == AGENT_VOICE_PCM_BUF_SIZE);
+    puts("PASS dialogue path is unaffected by the endpoint gate");
+
+    /* Sustained speech must still pass the gate. */
+    atomic_store(&pcm_pattern, 1);
+    atomic_store(&last_asr_bytes, 0);
+    assert(voice_channel_start() == 0); usleep(60000);
+    assert(voice_channel_stop_with_text(command, sizeof(command), true) == 0);
+    assert(atomic_load(&last_asr_bytes) > 0);
+    atomic_store(&pcm_pattern, 0);
+    puts("PASS sustained speech passes the endpoint gate and uploads once");
 
     before=atomic_load(&synths);
     assert(voice_channel_play_wake_prompt() == 0);
@@ -512,6 +545,11 @@ int main(void) {
     assert(voice_ui_bridge_chime() == 0); wait_speak_idle();
     assert(atomic_load(&capture_live) == 0 && atomic_load(&playback_live) == 0);
     puts("PASS busy playback, open/write/short-write failures release chime ownership and retry without TTS");
+
+    /* The dialogue tests below drive the wake listener all the way to a
+     * dispatch, and the endpoint gate only reaches the cloud when the window
+     * holds speech, so keep the fake microphone voiced until they finish. */
+    atomic_store(&pcm_pattern, 1);
 
     int sends = atomic_load(&dispatches);
     atomic_store(&wake_phrase, 2);
