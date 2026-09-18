@@ -1,6 +1,6 @@
 # R528 学习终端：当前硬件与链路状态
 
-> 更新时间：2026-09-15  
+> 更新时间：2026-09-16  
 > 规则：**“源码存在 / 已构建打包 / 已烧录 / 真机通过”是四个不同结论。** 本文只把确有现场证据的项目写为“真机通过”。不会记录 API Key、WiFi 密码或 Authorization 值。
 
 ## 总览
@@ -20,7 +20,8 @@
 | MiMo TTS | **真机已出声（走 nxplayer 回退）** | 2026-09-15 真机 `voice_test_speak 语音播报测试` → `MiMo TTS playback OK.`，`nxplayer fallback finished: status=0 bytes=84480`，total 5353ms；唤醒监听同时运行再测一次仍 OK（4526ms）。`media_player_open()` 在本板返回 NULL，播放走 `audio_playback.c` 的 nxplayer 回退（PCM 落盘 + `playraw`），**该告警不是故障**。 |
 | 数字麦克风 | **硬件/PCM 采集通过** | `hw:snddmic` 可打开，16 kHz / 16-bit / 单声道数据峰值非零。 |
 | MiMo ASR | **连续批量识别有现场成功证据** | 用户报告识别较准；日志有多轮 80000 bytes/25 chunks 与成功文本，也有空结果错误。`0 sent` 指未流式发送，不代表 batch ASR 没提交。 |
-| 唤醒词 | **匹配逻辑真机通过；英文链路有两个缺陷已修，待烧录复验** | 2026-09-13 六条用例通过、2026-09-15 复测 `Hello，openvela` / `Hello，OpenVela` / `你好，openvela` 仍 yes，`你好小米` 仍 no——**匹配函数是对的**。但真机发现两个下游缺陷：`voice_wake_test` 只取 `argv[1]`（`Hello, openvela` 被截成 `Hello,` → 误报 no），以及 `mimo_asr.c` 把 ASR 语种写死 `zh`（英文被按中文解码）。两者均已在 2026-09-15 候选修复，**真机复验待烧录**。**仍是云端批量 ASR 轮询，不是离线唤醒**——Key 过期则喊不醒。 |
+| 唤醒词 | **匹配逻辑真机通过（2026-09-16 真机复验 9/9 符合预期）** | 2026-09-13 六条用例通过、2026-09-15 复测 `Hello，openvela` / `Hello，OpenVela` / `你好，openvela` 仍 yes，`你好小米` 仍 no——**匹配函数是对的**。但真机发现两个下游缺陷：`voice_wake_test` 只取 `argv[1]`（`Hello, openvela` 被截成 `Hello,` → 误报 no），以及 `mimo_asr.c` 把 ASR 语种写死 `zh`（英文被按中文解码）。两者均已在 2026-09-15 候选修复，**真机复验待烧录**。**仍是云端批量 ASR 轮询，不是离线唤醒**——Key 过期则喊不醒。 |
+| 端点门控（静音不上传） | **已构建打包；真机复验待烧录** | 2026-09-16 真机实测：静置 65 s 出现 **16 次 ASR 上传 + 16 次 TLS 握手**（每 4.3 s 一轮），`endpoint gate: silence` **0 次**，而串口打出 `endpoint gate: speech 0ms, uploading` —— 判据 `speech_seen` 对整窗粘滞，被采集起始瞬态（`chunk#1` 峰值 11778–32768）每轮拉起。已改为窗口内累计有声时长（绝对阈值 500 ms，运行时可调 `voice_gate`）。 |
 | 对话速度 | **低延迟候选已打包，板端耗时未测** | `mimo-v2.5` 关闭思考、限制输出，去掉云端唤醒应答；等待慢回复期间不重新录音。 |
 | 提醒与主页圆环 | **提醒本体用户确认可用；提醒中心与圆环联动待真机验收** | 9/12 候选新增提醒中心（四种内容、10 秒–1 小时、三项快捷、16 条上限、逐条取消、清除全部、5 分钟后再提醒）。主页仍用调度器同一份快照，不建第二套倒计时。83 组主机检查通过。 |
 | 离线提示音 | **主机通过，真机待验** | 本地 360 ms 双音（600/800 Hz），不访问 MiMo；到期通知尊重主音量 0，语音页活动期间延后。返回 0 只表示受理，不代表已出声。 |
@@ -28,6 +29,93 @@
 | 学习工具页视觉 | **主机通过，真机待验** | 9/12 候选把工具页从不透明浅色整屏改成与主页同款（烘焙壁纸 + 深色顶栏/tabbar + 白色半透明卡片）。截图复查见 `tests/renders/`。 |
 | 学习报告 | **主机通过，真机待验** | 工具页第三个标签：今日专注 / 完成轮次 / 连续天数 / 近 7 天累计对周目标 / 任务待办。全部由 `focus_stats` 现算，不新增持久化。 |
 | `set_llm` | **现场待核对** | 当前源码与诊断 ELF 都有命令，但曾在板端得到 `Unknown command`。 |
+
+## 2026-09-16 端点门控真机复验与修复（当前候选）
+
+用户把板子接回 `COM15`，直接驱动真机复验 09-15 候选。结论：
+**09-15 的英文唤醒修复真机生效，但端点门控完全没生效。**
+完整记录见 [wake-gate-20260916.md](wake-gate-20260916.md)。
+
+### 一、09-15 修复真机复验：通过
+
+9 条离线用例（`voice_wake_test`，不用麦克风/网络/Key）全部符合预期。
+`Hello, openvela` 与 `hello openvela` 从 `no` 翻成 `yes` ——
+这是缺陷 A（`voice_wake_test` 只取 `argv[1]`）修复在真机生效的硬证据。
+
+| # | 命令 | 修复前 | 2026-09-16 实测 |
+|---|---|---|---|
+| 1 | `Hello，openvela` | yes | yes |
+| 2 | `Hello, openvela` | no | **yes** |
+| 3 | `hello openvela` | no | **yes** |
+| 4 | `Hello，OpenVela` | yes | yes |
+| 5 | `你好，openvela` | yes | yes |
+| 6 | `你好 openvela` | yes | yes |
+| 7 | `你好小米` | no | no |
+| 8 | `小米同学` | no | no |
+| 9 | `你好` | no | no |
+
+### 二、端点门控：完全没生效
+
+`voice_wake_start` 后静置 65 秒，一个字不说：
+
+| 观察点 | 实测 | 期望 |
+|---|---|---|
+| `batch ASR (with_text)` | **16 次 / 69 s** | 0 次 |
+| `vela_tls Handshake OK` | **16 次** | 0 次 |
+| `endpoint gate: silence` | **0 次** | 每轮一次 |
+| `batch ASR result:`（幻觉文本） | **16 条** | 无 |
+
+铁证是这一行：`[voice] endpoint gate: speech 0ms, uploading` ——
+门控读到的累计有声是 **0 ms**，却走了“有语音”分支。
+两个读数在同一把互斥锁里取，所以不是竞态而是逻辑：09-15 的门控判的是
+`speech_seen`，而它**一旦置位就在整个窗口里黏住**；
+采集通路的起始瞬态（`chunk#1` 峰值 11778–32768）每轮都够把它拉起来。
+
+幻觉文本 `你觉得他们大不大？` / `Oh.` / `Why?` / `Yeah.` / `Okay.` 中
+**没有一条**匹配唤醒词（`wake phrase matched` = 0），所以从未误唤醒。
+
+### 三、三个假设已用实验排除
+
+| 假设 | 实验 | 结论 |
+|---|---|---|
+| 唤醒监听把 TTS 饿死 / 打满配额 | 4 分钟静音压测：64 次 ASR 上传 + 65 次 TLS 握手后立刻播报 | **不成立**：TTS 仍成功，`TTS stream failed` = 0 |
+| TTS 本身坏了 | 连续重复 `voice_test_speak` 8 次 | **不成立**：**8/8 成功**，3971–5615 ms |
+| 对话链路坏了 | `ask 用一句话介绍你自己` | **不成立**：LLM 往返 2605 ms，回答正常 |
+
+→ 用户说的「不能说话」不是 TTS 或对话坏了，而是**设备永远走不到说话那一步**：
+唤醒循环一直停在“录音→上传→幻觉文本”里。
+
+### 四、修复
+
+判据换成**窗口内累计有声时长**（`voiced_total_ms`，安静 chunk 不清零），
+门控只判 `voiced >= s_gate_min_voiced_ms`（默认 500 ms）。
+新增 `voice_gate [ms]` 运行时可调，不用重烧即可校准。
+
+> 第一版还加了“有声占比 ≥ 25%”，被主机测试打回：占空比**依赖窗口长度**
+> （夹具 10000 ms vs 板端 2500 ms，同一段 700 ms 语音算出 7% vs 28%），
+> 会把真话当噪声丢掉。绝对毫秒与配置无关，故只保留绝对阈值。
+
+### 五、验证状态
+
+- **主机**：`run_checks.py` + `run_ui_checks.py` 合计 **87 PASS / 0 FAIL**
+  （voice 27 / chat 3 / cron 23 / api 4 / focus 8 / UI 11+11）。
+  新增回归用例 `pcm_pattern == 3`（窗口头部 4 帧有声）：
+  补丁前的门控会让它失败（`voice_integration.c:464`），补丁后通过。
+- **真机**：本轮改动**已构建打包，尚未烧录**。门控生效与 TTS 出声待烧录后补。
+
+**构建与配对取证**（`verify_pair.py` 全绿）：
+
+| 项 | 值 |
+|---|---|
+| 审计改动文件 | 5（`unexpected_changes: []`） |
+| 已重编改动单元 | 3 |
+| ELF/bin 全量配对 | `elf_to_bin_equal: true`，11,859,396 B |
+| 镜像 | 40,845,312 B，`8296a1284161445936d0777f0fcd7e1e95866f316a987028340d5733a34fec93` |
+| ELF | 68,686,580 B，`10ea9b662de37eddac5d391531e7b0df6d95341d4c9d191cec74d85264f1c277` |
+| 载荷校验 | `packed_private_config_matches_seed: true`、`non_model_settings_unchanged: true` |
+| 归档 | `img_backups/study-offline-candidate_20260916_145833`，`host_test_groups: 87` |
+
+烧录清单见 [wake-gate-20260916-checklist.md](wake-gate-20260916-checklist.md)。
 
 ## 2026-09-15 唤醒词英文识别与唤醒监听流量修复（当前候选）
 

@@ -146,8 +146,11 @@ int audio_capture_read(audio_capture_t *cap, void *buf, size_t n) {
     int16_t *samples = buf;
     for (int i = 0; i < 1600; i++) {
         int pattern = atomic_load(&pcm_pattern);
+        /* pattern 3 = start-of-window transient only: four voiced frames,
+         * enough to latch speech_seen but far short of a phrase. */
         samples[i] = ((pattern == 1 && frame >= 2 && frame < 9)
-                      || (pattern == 2 && frame == 0))
+                      || (pattern == 2 && frame == 0)
+                      || (pattern == 3 && frame >= 1 && frame < 5))
             ? (i % 2 ? 2200 : -2200) : 0;
     }
     return 3200;
@@ -445,6 +448,23 @@ int main(void) {
     assert(voice_channel_stop_with_text(command, sizeof(command), true) == -EAGAIN);
     assert(atomic_load(&last_asr_bytes) == 0);
     puts("PASS silent wake window is gated locally with no ASR request");
+
+    /* Regression for the 2026-09-16 real-machine finding.  A window whose
+     * only energy is the start-of-window transient still latches
+     * speech_seen, so a gate keyed on speech_seen alone uploads 80 KB plus a
+     * TLS handshake every few seconds of silence (measured: 16 uploads in
+     * 69 s).  Four voiced frames latch the flag but leave only 300 ms of
+     * cumulative voiced time in a 1300 ms window, which the gate must
+     * reject. */
+    atomic_store(&pcm_pattern, 3);
+    atomic_store(&last_asr_bytes, 0);
+    assert(voice_channel_start() == 0);
+    for (int i = 0; i < 1000 && !voice_channel_utterance_done(); i++) usleep(1000);
+    assert(voice_channel_utterance_done());
+    assert(voice_channel_stop_with_text(command, sizeof(command), true) == -EAGAIN);
+    assert(atomic_load(&last_asr_bytes) == 0);
+    atomic_store(&pcm_pattern, 0);
+    puts("PASS transient-only window is gated: speech_seen latches, voiced time does not");
 
     /* The same silent window still reaches the cloud for a user-triggered
      * dialogue, which passes require_speech=false. */
